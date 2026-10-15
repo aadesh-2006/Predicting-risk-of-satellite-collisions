@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data directories (raw and processed dataset artifacts)
+data/
+*.csv
+*.zip
+*.gz
+*.pickle
+*.pkl
+*.joblib
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE and system
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs and checkpoints
+checkpoints/
+*.pt
+*.pth
+logs/
+runs/
+*.log
+
+# Sensitive / private data files
+*private*
+test_data*.csv
+
+# Temporary inspection/scratch artifacts
+scripts/inspection_results.json
+
