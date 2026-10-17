@@ -130,3 +130,17 @@ The improvement in disjoint validation score ($540.6164$ vs $549.8525$, a $9.24$
 
 > [!NOTE]
 > The dramatic divergence between in-sample scores ($\approx 5.7\text{--}7.7$) and leakage-free generalization scores ($\approx 540\text{--}550$) demonstrates why separating training and evaluation event IDs is critical. Overlapping validation masks catastrophic failure modes on late-escalating conjunctions like Events 11795 and 2958.
+
+---
+
+## 8. Methodological Limitations & Generalization Caveats
+
+1. **Small Critical Sample Size ($N=12$):**  
+   Because the strict operational dataset pool contains only 61 eligible critical conjunctions in total, reserving 20% for disjoint validation yields exactly 12 critical events. While this 12-event sample is sufficient to definitively expose the pre-cutoff information barrier, individual event classifications carry substantial statistical leverage:
+   - A single event shifting across the $-6.0$ cutoff (such as Event 9657 predicting $-6.1360$ vs $-5.9724$) alters recall by $8.33\%$ ($1/12$).
+   - A single false negative with flat pre-cutoff history (Event 11795) contributes $613.02$ squared error, single-handedly determining $89\%$ of the critical MSE ($57.38$).
+2. **Hidden Leaderboard Generalization:**  
+   The paper's published score of $1.337$ was computed by the official ESA Kelvins competition server against a private, hidden test set (`test_data_private.csv`). Local validation on operational training data—even when strictly partitioned to avoid event-ID leakage—operates under different sampling boundaries and data regimes. Consequently:
+   - Our disjoint validation scores ($\approx 540\text{--}550$) should **not** be compared directly as an inferior reproduction of the paper's $1.337$ test score.
+   - These local validation results establish honest generalization behavior across the public dataset, demonstrating the limitations of sequence-only GRU modeling when physical precursors are absent before the 2-day operational decision gate.
+
