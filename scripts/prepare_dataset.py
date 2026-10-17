@@ -284,6 +284,121 @@ def select_validation_samples(event_groups: Dict[int, pd.DataFrame],
     return val_all, val_disjoint, stats
 
 
+def generate_stratified_80_20_split(
+    event_groups: Dict[int, pd.DataFrame],
+    output_dir: Path,
+    random_seed: int = 42
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Generates a leakage-free 80/20 stratified operational split:
+    - Selects all 7,962 operational events (0 <= last_tca <= 1.0 and >= 1 CDM with tca >= 2.0).
+    - Partitions the 61 operational critical events into 49 train (80%) and 12 val (20%).
+    - Pairs 49 train critical events with 49 sampled non-critical events for 50/50 balanced training (98 events total).
+    - Places the remaining 7,852 non-critical events and 12 critical events into validation (7,864 events total).
+    - Fits an isolated MinMaxScaler STRICTLY on the 98 training events (zero leakage from validation).
+    - Saves:
+        1. data/processed/train_sequences_2_range_80_20.joblib
+        2. data/processed/val_operational_disjoint_80_20.joblib
+        3. data/processed/scaler_80_20.joblib
+    """
+    print("\n[Option A] Generating leakage-free 80/20 stratified operational split...")
+
+    # Extract operational pool (7,962 events: 0.0 <= last_tca <= 1.0 and >= 1 CDM with tca >= 2.0)
+    operational_samples = []
+    for eid, sample in event_groups.items():
+        last_tca = sample['time_to_tca'].iloc[-1]
+        up_2days = sample[sample['time_to_tca'] >= 2.0]
+
+        if 0.0 <= last_tca <= 1.0 and len(up_2days) > 0:
+            final_cdm = pd.DataFrame(sample.iloc[-1]).transpose()
+            new_sample = pd.concat([up_2days, final_cdm], axis=0, ignore_index=True)
+            operational_samples.append(new_sample)
+
+    print(f"Total operational events extracted: {len(operational_samples):,}")
+    assert len(operational_samples) == 7962, f"Expected 7,962 operational events, found {len(operational_samples)}"
+
+    crit_samples = [s for s in operational_samples if s['risk'].iloc[-1] >= -6.0]
+    noncrit_samples = [s for s in operational_samples if s['risk'].iloc[-1] < -6.0]
+
+    print(f"  Operational critical events:     {len(crit_samples)}")
+    print(f"  Operational non-critical events: {len(noncrit_samples):,}")
+    assert len(crit_samples) == 61, f"Expected 61 critical events, found {len(crit_samples)}"
+    assert len(noncrit_samples) == 7901, f"Expected 7,901 non-critical events, found {len(noncrit_samples)}"
+
+    # Sort deterministically by event_id before seeded shuffle
+    crit_samples.sort(key=lambda s: int(s['event_id'].iloc[0]))
+    noncrit_samples.sort(key=lambda s: int(s['event_id'].iloc[0]))
+
+    rng = random.Random(random_seed)
+
+    # Stratify critical events: 49 train (80%), 12 val (20%)
+    crit_shuffled = list(crit_samples)
+    rng.shuffle(crit_shuffled)
+    train_crit = crit_shuffled[:49]
+    val_crit = crit_shuffled[49:]
+
+    # Sample non-critical events: 49 train (balanced), 7,852 val (remaining operational)
+    noncrit_shuffled = list(noncrit_samples)
+    rng.shuffle(noncrit_shuffled)
+    train_noncrit = noncrit_shuffled[:49]
+    val_noncrit = noncrit_shuffled[49:]
+
+    train_samples = train_crit + train_noncrit
+    val_samples = val_crit + val_noncrit
+
+    random.Random(random_seed).shuffle(train_samples)
+    random.Random(random_seed).shuffle(val_samples)
+
+    train_eids = set(int(s['event_id'].iloc[0]) for s in train_samples)
+    val_eids = set(int(s['event_id'].iloc[0]) for s in val_samples)
+    overlap = train_eids.intersection(val_eids)
+
+    print(f"  Split counts:")
+    print(f"    Train: {len(train_samples)} events (49 critical, 49 non-critical)")
+    print(f"    Val:   {len(val_samples)} events (12 critical, 7,852 non-critical)")
+    print(f"    Event ID overlap: {len(overlap)}")
+    assert len(train_samples) == 98, f"Expected 98 train events, got {len(train_samples)}"
+    assert len(val_samples) == 7864, f"Expected 7,864 val events, got {len(val_samples)}"
+    assert len(overlap) == 0, f"Event overlap detected: {overlap}"
+
+    # Fit isolated MinMaxScaler STRICTLY on the 98 training events
+    print("\nFitting isolated MinMaxScaler strictly on 98 training events...")
+    train_cdms_df = pd.concat(train_samples, axis=0, ignore_index=True)
+    feature_df = train_cdms_df.drop(columns=['event_id', 'risk'])
+    feature_cols = feature_df.columns.tolist()
+
+    scaler_80_20 = MinMaxScaler()
+    scaler_80_20.fit(feature_df.to_numpy(dtype=np.float64))
+    tca_idx = feature_cols.index('time_to_tca')
+    scaler_80_20.data_min_[tca_idx] = 0.0
+
+    scaler_80_20_path = output_dir / "scaler_80_20.joblib"
+    joblib.dump({"scaler": scaler_80_20, "columns": feature_cols}, scaler_80_20_path)
+    print(f"Saved isolated fitted scaler to {scaler_80_20_path}")
+
+    # Prepare and save tensors
+    train_path = output_dir / "train_sequences_2_range_80_20.joblib"
+    val_path = output_dir / "val_operational_disjoint_80_20.joblib"
+
+    train_processed = prepare_tensors_and_save(train_samples, scaler_80_20, feature_cols, train_path)
+    val_processed = prepare_tensors_and_save(val_samples, scaler_80_20, feature_cols, val_path)
+
+    stats = {
+        "train_event_count": len(train_processed),
+        "train_critical_count": sum(1 for s in train_processed if s['target_risk'] >= -6.0),
+        "train_non_critical_count": sum(1 for s in train_processed if s['target_risk'] < -6.0),
+        "val_event_count": len(val_processed),
+        "val_critical_count": sum(1 for s in val_processed if s['target_risk'] >= -6.0),
+        "val_non_critical_count": sum(1 for s in val_processed if s['target_risk'] < -6.0),
+        "event_id_overlap": len(overlap),
+        "random_seed": random_seed,
+        "scaler_file": "scaler_80_20.joblib",
+        "train_event_ids": [int(s['event_id']) for s in train_processed],
+        "val_event_ids": [int(s['event_id']) for s in val_processed]
+    }
+    return train_processed, val_processed, stats
+
+
 def prepare_tensors_and_save(samples: List[pd.DataFrame], 
                              scaler: MinMaxScaler, 
                              feature_cols: List[str],
@@ -359,10 +474,13 @@ def main():
     parser.add_argument("--n-ranges", type=int, choices=[2, 6], default=6,
                         help="Balanced training set ranges: 2 (132 events, 50/50 balance) or 6 (138 events, 6 risk bins)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling (default: 42)")
+    parser.add_argument("--split-80-20", action="store_true",
+                        help="Generate leakage-free Option A 80/20 stratified operational split (98 train, 7,864 val) with isolated scaler")
     args = parser.parse_args()
 
+    mode_desc = "Option A 80/20 Stratified Operational Split" if args.split_80_20 else f"n_ranges={args.n_ranges}"
     print("=" * 60)
-    print(f"  ESA Collision Avoidance Challenge GRU Preprocessing (n_ranges={args.n_ranges})")
+    print(f"  ESA Collision Avoidance Challenge GRU Preprocessing ({mode_desc})")
     print("=" * 60)
     
     if not RAW_TRAIN_CSV.exists():
@@ -376,19 +494,7 @@ def main():
     # 1. Load and transform raw data
     transformed_df = load_and_transform_features(RAW_TRAIN_CSV)
     
-    # 2. Fit or load scaler on full training features
-    if scaler_path.exists() and args.n_ranges == 2:
-        print(f"[5/6] Loading existing fitted MinMaxScaler from {scaler_path}...")
-        scaler_dict = joblib.load(scaler_path)
-        scaler = scaler_dict["scaler"]
-        feature_cols = scaler_dict["columns"]
-    else:
-        print("[5/6] Fitting MinMaxScaler on transformed features...")
-        scaler, feature_cols = fit_feature_scaler(transformed_df)
-        joblib.dump({"scaler": scaler, "columns": feature_cols}, scaler_path)
-        print(f"Saved fitted scaler to {scaler_path}")
-    
-    # 3. Build chronological event groups
+    # 2. Build chronological event groups
     event_groups = build_event_sequences(transformed_df)
     print(f"Total grouped unique events: {len(event_groups):,}")
     
@@ -399,6 +505,58 @@ def main():
                 existing_metadata = json.load(f)
         except Exception:
             existing_metadata = {}
+
+    if args.split_80_20:
+        # Option A: 80/20 stratified operational split with isolated scaler
+        print("\n[Option A] Executing 80/20 stratified operational split...")
+        train_processed, val_processed, split_stats = generate_stratified_80_20_split(
+            event_groups, OUTPUT_DIR, random_seed=args.seed
+        )
+
+        if "datasets" not in existing_metadata:
+            existing_metadata["datasets"] = {}
+        if "event_ids" not in existing_metadata:
+            existing_metadata["event_ids"] = {}
+
+        existing_metadata["datasets"]["train_2_range_80_20"] = {
+            "file": "train_sequences_2_range_80_20.joblib",
+            "description": "Leakage-free 80/20 operational split training set: 49 critical, 49 non-critical (50/50 balanced, 98 events total)",
+            "stats": compute_sequence_stats(train_processed),
+            "critical_events_count": split_stats["train_critical_count"],
+            "non_critical_events_count": split_stats["train_non_critical_count"],
+            "scaler_file": split_stats["scaler_file"],
+            "random_seed": args.seed
+        }
+        existing_metadata["datasets"]["val_operational_disjoint_80_20"] = {
+            "file": "val_operational_disjoint_80_20.joblib",
+            "description": "Leakage-free 80/20 operational split validation set: 12 critical, 7,852 non-critical (7,864 events total, 0 ID overlap)",
+            "stats": compute_sequence_stats(val_processed),
+            "critical_events_count": split_stats["val_critical_count"],
+            "non_critical_events_count": split_stats["val_non_critical_count"],
+            "overlap_with_train_2_range_80_20": split_stats["event_id_overlap"],
+            "scaler_file": split_stats["scaler_file"],
+            "random_seed": args.seed
+        }
+        existing_metadata["event_ids"]["train_2_range_80_20"] = split_stats["train_event_ids"]
+        existing_metadata["event_ids"]["val_disjoint_80_20"] = split_stats["val_event_ids"]
+
+        with open(metadata_path, "w") as f:
+            json.dump(existing_metadata, f, indent=2)
+        print(f"Updated audit metadata in {metadata_path}")
+        print("\n[SUCCESS] 80/20 stratified operational split and isolated scaler generated cleanly!")
+        return
+
+    # Fit or load scaler on full training features for 2-range/6-range baselines
+    if scaler_path.exists() and args.n_ranges == 2:
+        print(f"[5/6] Loading existing fitted MinMaxScaler from {scaler_path}...")
+        scaler_dict = joblib.load(scaler_path)
+        scaler = scaler_dict["scaler"]
+        feature_cols = scaler_dict["columns"]
+    else:
+        print("[5/6] Fitting MinMaxScaler on transformed features...")
+        scaler, feature_cols = fit_feature_scaler(transformed_df)
+        joblib.dump({"scaler": scaler, "columns": feature_cols}, scaler_path)
+        print(f"Saved fitted scaler to {scaler_path}")
 
     if args.n_ranges == 2:
         # Generate 2-range paper-aligned training dataset (132 events)

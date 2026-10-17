@@ -119,6 +119,33 @@ def compute_metrics(
     }
 
 
+def evaluate_samples(
+    model: SatelliteGRU,
+    samples: List[Dict[str, Any]],
+    device: torch.device
+) -> Dict[str, float]:
+    """
+    Evaluates model over an arbitrary list of preprocessed sequence samples.
+    """
+    model.eval()
+    predictions = []
+    targets = []
+
+    with torch.no_grad():
+        for sample in samples:
+            x_seq = torch.from_numpy(sample["input_sequence"]).float().to(device)
+            target = sample["target_risk"]
+
+            pred = model(x_seq).item()
+            predictions.append(pred)
+            targets.append(target)
+
+    y_hat_arr = np.array(predictions, dtype=np.float32)
+    y_arr = np.array(targets, dtype=np.float32)
+
+    return compute_metrics(y_hat_arr, y_arr)
+
+
 def evaluate_all_and_disjoint(
     model: SatelliteGRU,
     val_all_samples: List[Dict[str, Any]],
@@ -156,8 +183,8 @@ def parse_args():
         "--dataset",
         type=str,
         default="6-range",
-        choices=["2-range", "6-range", "2", "6"],
-        help="Training dataset selection: '2-range' (132 events, 50/50 balance) or '6-range' (138 events, 6 risk bins). Default: '6-range'"
+        choices=["2-range", "6-range", "2", "6", "2-range-split", "2-split", "80-20", "2-range-80-20"],
+        help="Training dataset selection: '2-range' (132 events, 50/50 balance), '6-range' (138 events, 6 risk bins), or '2-range-split'/'80-20' (98 events 80/20 stratified operational split). Default: '6-range'"
     )
     parser.add_argument(
         "--exp-name",
@@ -197,17 +224,35 @@ def train(args=None):
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Determine dataset paths and output artifact names based on selected dataset and optional exp_name
+    is_2_range_split = args.dataset in ("2-range-split", "2-split", "80-20", "2-range-80-20")
     is_2_range = args.dataset in ("2-range", "2")
     exp_name = getattr(args, "exp_name", None)
 
     if exp_name:
-        dataset_name = f"{'2-range' if is_2_range else '6-range'} (exp: {exp_name})"
-        train_data_file = PROCESSED_DATA_DIR / ("train_sequences_2_ranges.joblib" if is_2_range else "train_sequences_6_ranges.joblib")
+        if is_2_range_split:
+            dataset_name = f"2-range-80-20 (exp: {exp_name})"
+            train_data_file = PROCESSED_DATA_DIR / "train_sequences_2_range_80_20.joblib"
+            expected_events = 98
+        elif is_2_range:
+            dataset_name = f"2-range (exp: {exp_name})"
+            train_data_file = PROCESSED_DATA_DIR / "train_sequences_2_ranges.joblib"
+            expected_events = 132
+        else:
+            dataset_name = f"6-range (exp: {exp_name})"
+            train_data_file = PROCESSED_DATA_DIR / "train_sequences_6_ranges.joblib"
+            expected_events = 138
         best_checkpoint_path = CHECKPOINT_DIR / f"best_gru_{exp_name}_checkpoint.pt"
         final_checkpoint_path = CHECKPOINT_DIR / f"final_gru_{exp_name}_checkpoint.pt"
         metrics_csv_path = RESULTS_DIR / f"training_metrics_{exp_name}.csv"
         summary_path = RESULTS_DIR / f"training_summary_{exp_name}.json"
-        expected_events = 132 if is_2_range else 138
+    elif is_2_range_split:
+        dataset_name = "2-range-80-20 (Option A 80/20 stratified operational split)"
+        train_data_file = PROCESSED_DATA_DIR / "train_sequences_2_range_80_20.joblib"
+        best_checkpoint_path = CHECKPOINT_DIR / "best_gru_2_range_80_20_checkpoint.pt"
+        final_checkpoint_path = CHECKPOINT_DIR / "final_gru_2_range_80_20_checkpoint.pt"
+        metrics_csv_path = RESULTS_DIR / "training_metrics_2_range_80_20.csv"
+        summary_path = RESULTS_DIR / "training_summary_2_range_80_20.json"
+        expected_events = 98
     elif is_2_range:
         dataset_name = "2-range (paper-aligned 50/50 balance)"
         train_data_file = PROCESSED_DATA_DIR / "train_sequences_2_ranges.joblib"
@@ -231,14 +276,31 @@ def train(args=None):
     val_all_samples = joblib.load(VAL_ALL_FILE)
 
     train_eids = set(s["event_id"] for s in train_samples)
-    disjoint_indices = np.array([
-        i for i, s in enumerate(val_all_samples) if s["event_id"] not in train_eids
-    ], dtype=np.int64)
+
+    if is_2_range_split:
+        val_disjoint_file = PROCESSED_DATA_DIR / "val_operational_disjoint_80_20.joblib"
+        assert val_disjoint_file.exists(), f"Disjoint validation file not found: {val_disjoint_file}"
+        val_disjoint_samples = joblib.load(val_disjoint_file)
+        disjoint_eids = set(s["event_id"] for s in val_disjoint_samples)
+        overlap = train_eids.intersection(disjoint_eids)
+        assert len(overlap) == 0, f"Critical error: {len(overlap)} overlapping event IDs detected between train and val_disjoint!"
+        disjoint_indices = None
+    else:
+        val_disjoint_file = None
+        val_disjoint_samples = None
+        disjoint_indices = np.array([
+            i for i, s in enumerate(val_all_samples) if s["event_id"] not in train_eids
+        ], dtype=np.int64)
 
     pos_count = sum(1 for s in train_samples if s["target_risk"] >= THRESHOLD_CRITICAL)
     neg_count = sum(1 for s in train_samples if s["target_risk"] < THRESHOLD_CRITICAL)
     crit_val_all = sum(1 for s in val_all_samples if s["target_risk"] >= THRESHOLD_CRITICAL)
-    crit_disjoint = sum(1 for idx in disjoint_indices if val_all_samples[idx]["target_risk"] >= THRESHOLD_CRITICAL)
+    if is_2_range_split:
+        crit_disjoint = sum(1 for s in val_disjoint_samples if s["target_risk"] >= THRESHOLD_CRITICAL)
+        disjoint_len = len(val_disjoint_samples)
+    else:
+        crit_disjoint = sum(1 for idx in disjoint_indices if val_all_samples[idx]["target_risk"] >= THRESHOLD_CRITICAL)
+        disjoint_len = len(disjoint_indices)
 
     loss_arg = getattr(args, "loss", "weighted_mse").lower()
     is_standard_mse = loss_arg in ("standard_mse", "mse")
@@ -249,11 +311,14 @@ def train(args=None):
     print(f"  Class balance: {pos_count} high-risk (>= -6.0), {neg_count} low-risk (< -6.0)")
     print(f"  Loss function: {loss_desc}")
     print(f"Loaded {len(val_all_samples)} validation events (val_operational_all: {crit_val_all} critical, {len(val_all_samples) - crit_val_all} non-critical).")
-    print(f"Derived {len(disjoint_indices)} disjoint validation events (val_operational_disjoint: {crit_disjoint} critical, {len(disjoint_indices) - crit_disjoint} non-critical).")
+    print(f"Loaded {disjoint_len} disjoint validation events (val_operational_disjoint: {crit_disjoint} critical, {disjoint_len - crit_disjoint} non-critical).")
     if crit_disjoint == 0:
         print("  [DIAGNOSTIC NOTE] Derived disjoint validation set has 0 critical events (target_risk >= -6.0).")
         print("                    The 2-range balanced training set exhausts all 61 operational critical candidates.")
         print("                    Consequently, disjoint critical MSE and composite score are mathematically undefined (NaN).")
+    elif is_2_range_split:
+        print(f"  [VERIFIED] 80/20 Stratified Operational Split has 0 event-ID overlap and {crit_disjoint} critical validation events.")
+        print(f"             Disjoint evaluation is leakage-free and fully finite!")
     print(f"Artifact paths:")
     print(f"  - Best Checkpoint:  {best_checkpoint_path}")
     print(f"  - Final Checkpoint: {final_checkpoint_path}")
@@ -332,7 +397,11 @@ def train(args=None):
 
         # Evaluate at interval and final epoch
         if epoch % eval_interval == 0 or epoch == epochs:
-            m_all, m_disjoint = evaluate_all_and_disjoint(model, val_all_samples, disjoint_indices, device)
+            if is_2_range_split:
+                m_disjoint = evaluate_samples(model, val_disjoint_samples, device)
+                m_all = evaluate_samples(model, val_all_samples, device)
+            else:
+                m_all, m_disjoint = evaluate_all_and_disjoint(model, val_all_samples, disjoint_indices, device)
 
             print(
                 f"\r{epoch:<6} | {avg_train_loss:<10.4f} | "
@@ -349,15 +418,19 @@ def train(args=None):
                     round(m_disjoint["score"], 4), round(m_disjoint["critical_mse"], 4), round(m_disjoint["f2_score"], 4), round(m_disjoint["overall_mse"], 4)
                 ])
 
-            # Checkpoint on best val_all composite score (faithful to authors' pipeline)
-            if m_all["score"] < best_score:
-                best_score = m_all["score"]
+            # Checkpoint selection:
+            # For 2-range-split: driven by clean disjoint validation score (12 critical events, zero leakage)
+            # For 2-range / 6-range baselines: driven by val_all score (faithful to authors' original protocol)
+            eval_score = m_disjoint["score"] if is_2_range_split else m_all["score"]
+            if eval_score < best_score:
+                best_score = eval_score
                 best_epoch = epoch
                 best_metrics_summary = {
                     "best_epoch": best_epoch,
                     "train_loss": avg_train_loss,
                     "val_operational_all": m_all,
-                    "val_operational_disjoint": m_disjoint
+                    "val_operational_disjoint": m_disjoint,
+                    "selection_metric": "val_operational_disjoint.score" if is_2_range_split else "val_operational_all.score"
                 }
 
                 torch.save({
@@ -403,8 +476,8 @@ def train(args=None):
         "best_metrics": best_metrics_summary,
         "paper_comparison": {
             "published_score": 1.337,
-            "measured_val_operational_all_score": round(best_metrics_summary["val_operational_all"]["score"], 4),
-            "measured_val_operational_disjoint_score": round(best_metrics_summary["val_operational_disjoint"]["score"], 4)
+            "measured_val_operational_all_score": round(best_metrics_summary["val_operational_all"]["score"], 4) if np.isfinite(best_metrics_summary["val_operational_all"]["score"]) else None,
+            "measured_val_operational_disjoint_score": round(best_metrics_summary["val_operational_disjoint"]["score"], 4) if np.isfinite(best_metrics_summary["val_operational_disjoint"]["score"]) else None
         }
     }
 
@@ -415,6 +488,8 @@ def train(args=None):
     print(f"\n============================================================")
     print(f"  Best Checkpoint (Epoch {best_epoch}):")
     print(f"  - Dataset:                  {dataset_name}")
+    sel_metric = best_metrics_summary.get("selection_metric", "val_operational_all.score")
+    print(f"  - Selection Metric:         {sel_metric}")
     print(f"  - val_operational_all:      Score = {best_metrics_summary['val_operational_all']['score']:.4f} "
           f"(CritMSE={best_metrics_summary['val_operational_all']['critical_mse']:.4f}, F2={best_metrics_summary['val_operational_all']['f2_score']:.4f})")
     print(f"  - val_operational_disjoint: Score = {best_metrics_summary['val_operational_disjoint']['score']:.4f} "

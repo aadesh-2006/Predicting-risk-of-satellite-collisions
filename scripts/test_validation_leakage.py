@@ -44,6 +44,9 @@ VAL_ALL_FILE = PROCESSED_DIR / "val_operational_all.joblib"
 VAL_DISJOINT_LEGACY = PROCESSED_DIR / "val_operational_disjoint.joblib"
 VAL_DISJOINT_2R_FILE = PROCESSED_DIR / "val_operational_disjoint_2_ranges.joblib"
 VAL_DISJOINT_6R_FILE = PROCESSED_DIR / "val_operational_disjoint_6_ranges.joblib"
+TRAIN_80_20_FILE = PROCESSED_DIR / "train_sequences_2_range_80_20.joblib"
+VAL_DISJOINT_80_20_FILE = PROCESSED_DIR / "val_operational_disjoint_80_20.joblib"
+SCALER_80_20_FILE = PROCESSED_DIR / "scaler_80_20.joblib"
 BEST_2R_CHECKPOINT = CHECKPOINT_DIR / "best_gru_2_ranges_checkpoint.pt"
 
 
@@ -251,6 +254,68 @@ def run_tests():
         "Epoch-250 checkpoint metadata valid (epoch == 250, model_state_dict intact)",
         cp_data.get("epoch") == 250 and "model_state_dict" in cp_data,
         f"Epoch: {cp_data.get('epoch')}, Dataset: {cp_data.get('dataset')}"
+    )
+
+    # -------------------------------------------------------------
+    # PART D: OPTION A 80/20 STRATIFIED OPERATIONAL SPLIT
+    # -------------------------------------------------------------
+    print("\n[Phase 5] Evaluating Option A 80/20 Stratified Operational Split...")
+
+    # Test 16: Existence of 80/20 artifacts
+    check(
+        "80/20 Split: Artifacts exist (train, val_disjoint, scaler)",
+        TRAIN_80_20_FILE.exists() and VAL_DISJOINT_80_20_FILE.exists() and SCALER_80_20_FILE.exists(),
+        f"Train: {TRAIN_80_20_FILE.name}, Val: {VAL_DISJOINT_80_20_FILE.name}, Scaler: {SCALER_80_20_FILE.name}"
+    )
+
+    train_80_20 = joblib.load(TRAIN_80_20_FILE)
+    val_disjoint_80_20 = joblib.load(VAL_DISJOINT_80_20_FILE)
+    train_80_20_eids = set(s["event_id"] for s in train_80_20)
+    val_80_20_eids = set(s["event_id"] for s in val_disjoint_80_20)
+
+    # Test 17: Zero event ID overlap
+    overlap_80_20 = train_80_20_eids.intersection(val_80_20_eids)
+    check(
+        "80/20 Split: Zero training event ID overlap in disjoint validation set",
+        len(overlap_80_20) == 0,
+        f"Overlap count: {len(overlap_80_20)}"
+    )
+
+    # Test 18: Exact counts and partition of operational pool
+    check(
+        "80/20 Split: Exact event counts (98 train, 7,864 val) summing to 7,962 operational pool",
+        len(train_80_20) == 98 and len(val_disjoint_80_20) == 7864 and (train_80_20_eids | val_80_20_eids) == val_all_eids,
+        f"Train: {len(train_80_20)}, Val: {len(val_disjoint_80_20)}, Union size: {len(train_80_20_eids | val_80_20_eids)}/7962"
+    )
+
+    # Test 19: Stratification and class balance
+    crit_train_80_20 = sum(1 for s in train_80_20 if s["target_risk"] >= THRESHOLD_CRITICAL)
+    noncrit_train_80_20 = sum(1 for s in train_80_20 if s["target_risk"] < THRESHOLD_CRITICAL)
+    crit_val_80_20 = sum(1 for s in val_disjoint_80_20 if s["target_risk"] >= THRESHOLD_CRITICAL)
+    noncrit_val_80_20 = sum(1 for s in val_disjoint_80_20 if s["target_risk"] < THRESHOLD_CRITICAL)
+    check(
+        "80/20 Split: Stratification matches requirements (49/49 train, 12/7852 val)",
+        crit_train_80_20 == 49 and noncrit_train_80_20 == 49 and crit_val_80_20 == 12 and noncrit_val_80_20 == 7852,
+        f"Train: {crit_train_80_20} crit / {noncrit_train_80_20} non-crit; Val: {crit_val_80_20} crit / {noncrit_val_80_20} non-crit"
+    )
+
+    # Test 20: Isolated scaler fitted properly
+    scaler_dict_80_20 = joblib.load(SCALER_80_20_FILE)
+    scaler_obj_80_20 = scaler_dict_80_20.get("scaler")
+    check(
+        "80/20 Split: Isolated scaler is valid MinMaxScaler with 63 feature columns",
+        scaler_obj_80_20 is not None and len(scaler_dict_80_20.get("columns", [])) == 63,
+        f"Scaler type: {type(scaler_obj_80_20).__name__}, Feature count: {len(scaler_dict_80_20.get('columns', []))}"
+    )
+
+    # Test 21: Metric finiteness on val_operational_disjoint_80_20
+    y_true_80_20 = np.array([s["target_risk"] for s in val_disjoint_80_20], dtype=np.float32)
+    y_pred_80_20 = y_true_80_20 + 0.1
+    metrics_80_20 = compute_metrics(y_pred_80_20, y_true_80_20)
+    check(
+        "80/20 Split: Metrics strictly finite on disjoint validation set (resolves NaN issue)",
+        np.isfinite(metrics_80_20["critical_mse"]) and np.isfinite(metrics_80_20["score"]) and np.isfinite(metrics_80_20["f2_score"]) and metrics_80_20["critical_count"] == 12,
+        f"critical_count: {metrics_80_20['critical_count']}, critical_mse: {metrics_80_20['critical_mse']:.4f}, f2: {metrics_80_20['f2_score']:.4f}, score: {metrics_80_20['score']:.4f}"
     )
 
     print("-" * 80)

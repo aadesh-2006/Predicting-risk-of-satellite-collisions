@@ -317,6 +317,101 @@ def run_tests():
         "Epochs 1 (no eval) and 2 (final eval) completed without scope or unbound variable error" if reg_success else f"Error: {reg_error}"
     )
 
+    # Check 16: CLI argument parsing: --dataset 2-range-split and aliases
+    try:
+        sys.argv = ["train_gru.py", "--dataset", "2-range-split", "--dry-run"]
+        args_split = parse_args()
+        sys.argv = ["train_gru.py", "--dataset", "80-20", "--dry-run"]
+        args_8020 = parse_args()
+        check(
+            "CLI argument parsing: --dataset 2-range-split and 80-20",
+            args_split.dataset == "2-range-split" and args_8020.dataset == "80-20",
+            f"Parsed split: {args_split.dataset}, 80-20: {args_8020.dataset}"
+        )
+    finally:
+        sys.argv = sys_argv_backup
+
+    # Check 17: Verify 2-range-split dataset files resolution and content
+    file_split_train = PROCESSED_DIR / "train_sequences_2_range_80_20.joblib"
+    file_split_val = PROCESSED_DIR / "val_operational_disjoint_80_20.joblib"
+    check(
+        "2-range-split dataset files exist",
+        file_split_train.exists() and file_split_val.exists(),
+        f"Train: {file_split_train.name}, Val: {file_split_val.name}"
+    )
+
+    data_split_train = joblib.load(file_split_train)
+    pos_split = sum(1 for s in data_split_train if s["target_risk"] >= -6.0)
+    neg_split = sum(1 for s in data_split_train if s["target_risk"] < -6.0)
+    check(
+        "2-range-split dataset content verification (98 events: 49 critical, 49 non-critical)",
+        len(data_split_train) == 98 and pos_split == 49 and neg_split == 49,
+        f"Total: {len(data_split_train)}, Critical: {pos_split}, Non-critical: {neg_split}"
+    )
+
+    # Check 18: Execute dry-run with 2-range-split dataset
+    print("\nExecuting dry-run test for 2-range-split (80/20) training pipeline...")
+    dry_args_split = argparse.Namespace(
+        dataset="2-range-split",
+        epochs=510,
+        eval_interval=25,
+        seed=42,
+        lr=0.001,
+        loss="weighted_mse",
+        dry_run=True
+    )
+    try:
+        train(dry_args_split)
+        check(
+            "2-range-split dry-run execution succeeded with zero errors",
+            True,
+            "1 forward/loss/backward pass completed cleanly on 80/20 train sample"
+        )
+    except Exception as e:
+        check(
+            "2-range-split dry-run execution succeeded with zero errors",
+            False,
+            f"Exception occurred: {e}"
+        )
+
+    # Check 19: Output paths for 2-range-split strictly separated from baselines
+    split_best_cp = CHECKPOINT_DIR / "best_gru_2_range_80_20_checkpoint.pt"
+    split_final_cp = CHECKPOINT_DIR / "final_gru_2_range_80_20_checkpoint.pt"
+    split_metrics = RESULTS_DIR / "training_metrics_2_range_80_20.csv"
+    split_summary = RESULTS_DIR / "training_summary_2_range_80_20.json"
+    check(
+        "2-range-split output filenames strictly separated from 2-range and 6-range baselines",
+        split_best_cp != EXISTING_6R_BEST_CP and split_best_cp != (CHECKPOINT_DIR / "best_gru_2_ranges_checkpoint.pt") and
+        split_summary != EXISTING_6R_SUMMARY and split_summary != (RESULTS_DIR / "training_summary_2_ranges.json"),
+        f"Isolated filenames: {split_best_cp.name}, {split_summary.name}"
+    )
+
+    # Check 20: Dry-run with --exp-name on 2-range-split
+    print("\nExecuting dry-run test for 2-range-split with custom --exp-name...")
+    dry_args_split_exp = argparse.Namespace(
+        dataset="2-range-split",
+        exp_name="test_split_exp",
+        epochs=510,
+        eval_interval=25,
+        seed=42,
+        lr=0.001,
+        loss="weighted_mse",
+        dry_run=True
+    )
+    try:
+        train(dry_args_split_exp)
+        check(
+            "2-range-split with custom exp-name dry-run execution succeeded",
+            True,
+            "Executed cleanly with custom experiment name"
+        )
+    except Exception as e:
+        check(
+            "2-range-split with custom exp-name dry-run execution succeeded",
+            False,
+            f"Exception occurred: {e}"
+        )
+
     print("-" * 80)
     print(f"RESULTS: {passed_checks}/{total_checks} tests passed.")
     print("=" * 80)

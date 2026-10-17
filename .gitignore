@@ -33,6 +33,9 @@ logs/
 runs/
 *.log
 
+# Experiment results, evaluation metrics, and generated summaries
+results/
+
 # Sensitive / private data files
 *private*
 test_data*.csv
